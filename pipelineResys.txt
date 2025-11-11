@@ -1,0 +1,301 @@
+Tuyệt — mình sẽ giải thích **cụ thể và hành động được** để bạn có thể **code lại hệ recommender giống repository đó** (MMCF: denoising autoencoder cho playlist + char-CNN cho tiêu đề + cách kết hợp). Mình sẽ cho bạn: kiến trúc tổng quan, pipeline xử lý dữ liệu, cấu trúc thư mục, chi tiết mô-đun (DAE, Char-CNN, fusion), loss & training loop, inference / tạo submission, các mẹo scaling & tuning, và skeleton code (PyTorch) để bạn bắt tay vào code liền. Mình giả sử bạn muốn dùng PyTorch (hiện đại hơn TF1) — nếu muốn TF mình sẽ chuyển nhanh.
+
+# 1 — Kiến trúc tổng quan (high level)
+
+1. **Data preprocessing**
+
+   * Từ Million Playlist Dataset (MPD): ánh xạ track -> id, artist -> id, playlist -> list(track_ids), playlist title (chuỗi).
+   * Loại bỏ track/artist quá ít xuất hiện (min_count). Tạo train/val/challenge splits theo kiểu cuộc thi (seed sizes khác nhau).
+
+2. **Two main modules**
+
+   * **DAE (Denoising Autoencoder)** cho collaborative filtering: input là vector bag-of-tracks (one-hot / multi-hot) + optional categorical features (artist, album, playlist features). Mô hình học reconstruct playlist (predict các track bị mask). DAE hỗ trợ kịch bản có nhiều seed tracks.
+   * **Char-level CNN** cho playlist title: chuyển tiêu đề thành embedding ký tự -> CNN -> representation (title embedding). Học để map title embedding -> track score distribution (hoặc map vào same latent space như DAE).
+
+3. **Fusion / Multimodal**
+
+   * Kết hợp embedding từ DAE và từ Title module (ví dụ concat rồi một fully-connected layer) để tạo final score cho mọi track. Có thể cân bằng khi title thiếu bằng weighting.
+
+4. **Training workflow**
+
+   * Pretrain DAE (tied weights) nếu muốn.
+   * Train DAE (reconstruction).
+   * Train Title module (map title => track distribution) — thường dùng cùng loss (cross-entropy / sigmoid BCE per-track).
+   * Fine-tune hoặc ensemble kết quả từ nhiều models/seed-schemes.
+   * Ghi kết quả cho các challenge groups, merge outputs.
+
+# 2 — Data pipeline chi tiết
+
+* **Step A**: Build vocabularies
+
+  * `track2id`, `artist2id`, `playlist2id` (if needed).
+  * Viết script để duyệt MPD JSON và count appearances. Lọc tracks có count < `mincount_trk`.
+
+* **Step B**: Representations
+
+  * Playlist vector: sparse multi-hot length `T` (T = số track sau lọc).
+  * Option: cũng build artist-multi-hot, album-multi-hot.
+  * Title: giữ raw string; chuyển sang lowercase, strip, limit length (e.g. 100 chars).
+
+* **Step C**: Create training examples (masking / denoising)
+
+  * For each playlist in train: randomly sample a subset of tracks as *observed/seed* (the input) and treat remaining tracks as *targets*. Denote `input_mask_ratio` = probability to mask an item from input (denoising).
+  * Save examples as (input_multi_hot, title, target_multi_hot). For efficiency: store as compressed numpy / pickle or LMDB.
+
+* **Step D**: Challenge splits
+
+  * Create different files for seed groups (seed size 0,1,5,10,25,100, random variations). This helps training models tuned per-group.
+
+# 3 — Mô hình — chi tiết kỹ thuật
+
+## 3.1 Denoising Autoencoder (DAE) — idea
+
+* Input: `x_in` multi-hot vector length `T`.
+* Denoising: randomly drop some 1s in `x_in` (Bernoulli dropout on non-zero positions) to get `x_masked`.
+* Encoder: `h = f_enc(W_enc * x_masked + b)` (dense layers).
+* Decoder: `y = sigmoid(W_dec * h + b_dec)` — output là probability per-track.
+* Loss: Binary Cross-Entropy (BCE) per track between `y` and `x_true` (complete playlist multi-hot) — optionally weighted (to handle class imbalance).
+* Tied weights optional (W_dec = W_enc^T).
+* Regularization: dropout, L2.
+
+## 3.2 Char-level CNN (Title module)
+
+* Input: sequence of characters (map char->index, alphabet size ~70). Pad/truncate to `max_len`.
+* Character embedding layer (learnable small embedding, e.g., 16-32 dim).
+* Several 1D conv layers with multiple kernel sizes (e.g., kernel sizes 3,4,5) + max-over-time pooling per filter.
+* Concat pooled features -> FC -> `title_repr` (embedding vector).
+* Map `title_repr` -> track scores: `score = sigmoid(Linear(title_repr, T))` (T large — heavy). Practical trick: project `title_repr` to same latent space as DAE hidden, then `score = sigmoid(TrackEmbeddings @ title_repr)`.
+
+  * So maintain `track_embedding` matrix `E_track` (T x d). Compute `score = sigmoid(E_track @ title_repr)` which is efficient if `d` small.
+
+## 3.3 Fusion
+
+* From DAE get `h_dae` (latent), from title `h_title`.
+* Fusion options:
+
+  * Concatenate: `h = concat(h_dae, h_title)` -> FC -> project to `d`, score via dot with `E_track`.
+  * Weighted sum: `h = alpha*h_dae + (1-alpha)*h_title` (alpha learned or hyperparam).
+  * For playlists with no title or no seed tracks set alpha accordingly.
+
+# 4 — Losses, Metrics, Training recipe
+
+* **Loss**: BCE per-track between predicted probabilities and true target multi-hot (reconstruction). For title module you train similarly—if training paired with DAE you can have joint loss: `L = L_dae + lambda * L_title`.
+* **Negative sampling**: since T is large, computing BCE over all tracks is expensive — you can sample negative tracks per batch (sample uniform or popularity-based negatives). But the original repo reconstructs the full vector; if you have resources compute full BCE else use sampled softmax / sampled BCE.
+* **Metrics** (for dev): R-precision, NDCG@K, Recall@K, MAP@K — implement same metrics as challenge if possible. Evaluate separately per seed group.
+
+# 5 — Inference (generate recommendations)
+
+1. For a given playlist (seed tracks + maybe title), build `x_input` (mask not applied).
+2. Compute DAE output probs `p_dae`, compute title probs `p_title`.
+3. Combine (e.g., weighted sum) -> final `p`.
+4. Remove seed tracks from candidate set (don’t recommend already in seed) and rank top-K.
+5. For challenge: produce required format CSV.
+
+# 6 — Scaling & engineering tricks
+
+* **Memory**: store track embeddings as `float32` large matrix ~ T x d. If T ~ 200k, embedding 128 dims ~ 200k*128*4 ≈ 100 MB — ok. But output layer if full linear to T per minibatch expensive; use dot with track embeddings to compute scores efficiently.
+* **Batching**: use sparse input (indices of tracks) to build dense input or use embeddings sum trick: represent playlist by sum of its track embeddings (`pooled embedding`) instead of multi-hot as input — that's another variant (embedding-sum DAE).
+* **Negative sampling / sampled softmax** if T huge.
+* **Multiple models / ensembles**: train DAE with different hyperparams / seed-schemes and average outputs.
+* **Precompute track norms** if using dot product and normalize to speed up similarity queries (e.g., use Faiss for nearest neighbor at inference).
+* **Checkpoint & reproducibility**: use seeds; save tokenizers/vocabs.
+
+# 7 — Suggested folder structure
+
+```
+spotify_recsys/
+├─ data/
+│  ├─ mpd_raw/
+│  ├─ preprocessed/
+│  ├─ examples/   # precomputed training examples (npy/lmdb)
+├─ src/
+│  ├─ data_utils.py
+│  ├─ dataset.py
+│  ├─ models/
+│  │  ├─ dae.py
+│  │  ├─ charcnn.py
+│  │  ├─ fusion.py
+│  ├─ train.py
+│  ├─ inference.py
+│  └─ eval.py
+├─ config.yaml
+├─ requirements.txt
+└─ README.md
+```
+
+# 8 — Skeleton code (PyTorch) — minimal working example
+
+> Đây là skeleton *cốt lõi* — để bạn nhanh dựng prototype. Mình trình bày core modules: DAE (with track embeddings trick), CharCNN, training loop.
+
+```python
+# src/models/dae.py
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class DAE(nn.Module):
+    def __init__(self, num_tracks, hidden_dim=512, latent_dim=128, tied_weights=False):
+        super().__init__()
+        self.num_tracks = num_tracks
+        self.track_embedding = nn.Embedding(num_tracks, latent_dim)  # E_track
+        # encoder: map sum of track embeddings -> latent
+        self.enc = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(hidden_dim, latent_dim),
+            nn.ReLU()
+        )
+        # decoder: map latent -> scores via dot with track_embedding
+        # no explicit large linear to tracks; we use dot product instead
+        # so no weights here except possible projection
+        # optional projection:
+        self.project = nn.Linear(latent_dim, latent_dim)
+
+    def forward(self, input_track_indices):  # input: list of lists (batch) => we get embeddings sum
+        # input_track_indices: tensor shape (batch, max_seed_count) with -1 padding
+        # compute mask and sum
+        mask = (input_track_indices >= 0)
+        embeds = self.track_embedding(input_track_indices.clamp(min=0))  # (B, L, d)
+        mask = mask.unsqueeze(-1).float()
+        sum_emb = (embeds * mask).sum(dim=1)  # (B, d)
+        # optionally normalize by count
+        counts = mask.sum(dim=1).clamp(min=1)
+        sum_emb = sum_emb / counts
+        h = self.enc(sum_emb)  # (B, latent)
+        h = self.project(h)  # (B, latent)
+        # scores = E_track @ h^T -> compute batch-wise
+        E = self.track_embedding.weight  # (T, d)
+        scores = torch.matmul(h, E.t())  # (B, T)
+        probs = torch.sigmoid(scores)
+        return probs, h
+```
+
+```python
+# src/models/charcnn.py
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class CharCNN(nn.Module):
+    def __init__(self, alphabet_size, emb_dim=32, out_dim=128, max_len=100, kernel_sizes=[3,4,5], num_filters=128):
+        super().__init__()
+        self.char_emb = nn.Embedding(alphabet_size, emb_dim, padding_idx=0)
+        self.convs = nn.ModuleList([
+            nn.Conv1d(emb_dim, num_filters, k) for k in kernel_sizes
+        ])
+        self.fc = nn.Sequential(
+            nn.Linear(num_filters * len(kernel_sizes), out_dim),
+            nn.ReLU(),
+            nn.Dropout(0.2)
+        )
+
+    def forward(self, char_idx):  # char_idx: (B, L)
+        x = self.char_emb(char_idx)  # (B, L, emb)
+        x = x.transpose(1,2)  # (B, emb, L)
+        outs = []
+        for conv in self.convs:
+            y = conv(x)  # (B, num_filters, L-k+1)
+            y = F.relu(y)
+            y = F.max_pool1d(y, kernel_size=y.size(2)).squeeze(2)  # (B, num_filters)
+            outs.append(y)
+        cat = torch.cat(outs, dim=1)  # (B, num_filters * n_k)
+        out = self.fc(cat)  # (B, out_dim)
+        return out
+```
+
+```python
+# src/models/fusion.py
+class MMCF(nn.Module):
+    def __init__(self, dae: DAE, charcnn: CharCNN, latent_dim=128):
+        super().__init__()
+        self.dae = dae
+        self.charcnn = charcnn
+        # fusion layer: project both to same dim then combine
+        self.proj_dae = nn.Linear(latent_dim, latent_dim)
+        self.proj_title = nn.Linear(charcnn.fc[0].out_features, latent_dim)
+        self.final_proj = nn.Linear(latent_dim*2, latent_dim)
+
+    def forward(self, seed_indices, title_chars):
+        probs_dae, h_d = self.dae(seed_indices)  # probs_dae (B,T), h_d (B, latent)
+        h_t = self.charcnn(title_chars)  # (B, tdim)
+        pd = self.proj_dae(h_d)
+        pt = self.proj_title(h_t)
+        h = torch.cat([pd, pt], dim=1)
+        h = self.final_proj(h)  # (B, latent)
+        E = self.dae.track_embedding.weight
+        scores = torch.matmul(h, E.t())  # (B, T)
+        probs = torch.sigmoid(scores)
+        # combine with probs_dae (optional)
+        final = 0.6 * probs_dae + 0.4 * probs
+        return final
+```
+
+```python
+# src/train.py (sketch)
+import torch
+from torch.utils.data import DataLoader
+from models import DAE, CharCNN, MMCF
+from dataset import PlaylistDataset  # you implement
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+dae = DAE(num_tracks=T).to(device)
+char = CharCNN(alphabet_size=ALPH).to(device)
+model = MMCF(dae, char).to(device)
+
+opt = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-6)
+bce = torch.nn.BCELoss(reduction='none')
+
+for epoch in range(1, epochs+1):
+    model.train()
+    for batch in train_loader:
+        seed_idx = batch['seed_indices'].to(device)   # (B, L)
+        title = batch['title_chars'].to(device)       # (B, Lc)
+        target = batch['target_multi_hot'].to(device) # (B, T) dense or sparse
+        pred = model(seed_idx, title)                 # (B, T)
+        loss_mat = bce(pred, target)
+        loss = loss_mat.mean()
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+    # validation & logging...
+```
+
+> Ghi chú: nếu `target` full (B,T) quá lớn bạn cần sampled BCE: chỉ compute BCE on positive + sampled negatives.
+
+# 9 — Practical tips & hyperparams
+
+* `latent_dim` 128, `hidden_dim` 512; char embedding 32; kernel filters 128 per kernel.
+* Batch size: 128–512 (tuỳ GPU).
+* LR: 1e-3, Adam.
+* Weight BCE pos/neg: track positives rarer — consider weighting positives higher (or use `pos_weight` in BCEWithLogitsLoss).
+* Denoising rate (input dropout): 0.3–0.7 (higher helps generalization).
+* Train title module both alone and jointly (freeze DAE then train fusion).
+* Early stopping on validation NDCG/Recall.
+
+# 10 — Evaluation / Debugging checklist
+
+* Unit test dataset loader on small subset (10 playlists).
+* Train a tiny model (T small, e.g., 200 tracks) to ensure training decreases loss and inference returns sensible tracks.
+* Visualize top recommendations for some playlists to sanity-check (do they match genre/title?).
+* Log training/val losses per seed group.
+
+# 11 — Next steps & extensions
+
+* Use **item-to-item** popularity / co-occurrence matrix as extra input to DAE.
+* Use **graph embeddings** (node2vec on track co-occurrence) as initial track embeddings.
+* Use **contrastive loss** (InfoNCE) between playlist embedding and contained tracks.
+* Use approximate nearest neighbor (Faiss) to speed retrieval.
+
+---
+
+Nếu bạn muốn mình làm tiếp **một trong các việc sau (mình sẽ code cụ thể cho bạn ngay)**:
+
+1. Viết **script preprocessing** MPD → vocab + saved examples (mình sẽ cung cấp code chi tiết).
+2. Viết **Dataset class** và **data generator** (kèm masking strategy).
+3. Viết file **train.py** hoàn chỉnh với sampled negative loss và checkpoint.
+4. Chuyển toàn bộ skeleton trên sang **TensorFlow 2** (nếu bạn muốn theo TF).
+
+Bạn chọn 1 trong 4 — mình sẽ code ngay phần đó (hoặc nếu muốn, mình làm tất cả từng bước). Bạn muốn bắt đầu từ phần nào?
+
